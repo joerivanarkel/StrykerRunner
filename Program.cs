@@ -206,19 +206,34 @@ class Program
             return new FileInfo(fullPath);
         }
 
-        // Search in parent directories
+        // Search in parent directories (limited scope to avoid permission issues)
         var projName = Path.GetFileName(relativePath);
         var searchDir = testProjectDir.Parent;
+        int maxLevels = 3; // Limit search depth to avoid scanning entire filesystem
+        int currentLevel = 0;
         
-        while (searchDir != null)
+        while (searchDir != null && currentLevel < maxLevels)
         {
-            var found = Directory.GetFiles(searchDir.FullName, projName, SearchOption.AllDirectories)
-                .FirstOrDefault();
-            if (found != null)
+            try
             {
-                return new FileInfo(found);
+                var found = Directory.GetFiles(searchDir.FullName, projName, SearchOption.AllDirectories)
+                    .FirstOrDefault();
+                if (found != null)
+                {
+                    return new FileInfo(found);
+                }
             }
+            catch (UnauthorizedAccessException)
+            {
+                // Skip directories we don't have permission to access
+            }
+            catch (IOException)
+            {
+                // Skip IO errors and continue searching
+            }
+            
             searchDir = searchDir.Parent;
+            currentLevel++;
         }
 
         return null;
