@@ -174,19 +174,12 @@ class Program
                 var projName = Path.GetFileNameWithoutExtension(refPath);
 
                 // Skip test projects
-                if (Regex.IsMatch(projName, @"\.Test$", RegexOptions.IgnoreCase))
+                if (Regex.IsMatch(projName, @"\.Tests?$", RegexOptions.IgnoreCase))
                     continue;
 
                 // Skip excluded patterns
-                bool excluded = false;
-                foreach (var pattern in excludePatterns)
-                {
-                    if (Regex.IsMatch(projName, pattern, RegexOptions.IgnoreCase))
-                    {
-                        excluded = true;
-                        break;
-                    }
-                }
+                bool excluded = excludePatterns.Any(pattern => 
+                    Regex.IsMatch(projName, pattern, RegexOptions.IgnoreCase));
 
                 if (!excluded)
                 {
@@ -294,26 +287,29 @@ class Program
         var options = new JsonSerializerOptions
         {
             WriteIndented = false,
-            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull
+            DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingNull,
+            Encoder = System.Text.Encodings.Web.JavaScriptEncoder.UnsafeRelaxedJsonEscaping
         };
 
         var finalJson = JsonSerializer.Serialize(report, options);
 
-        var htmlTemplate = $@"<!DOCTYPE html>
-<html>
-<head>
-  <meta charset=""utf-8"">
-  <script src=""https://www.unpkg.com/mutation-testing-elements""></script>
-</head>
-<body>
-  <mutation-test-report-app></mutation-test-report-app>
-  <script>
-    const app = document.querySelector('mutation-test-report-app');
-    app.report = {finalJson};
-  </script>
-</body>
-</html>";
+        // Write HTML with embedded JSON report
+        var htmlContent = new StringBuilder();
+        htmlContent.AppendLine("<!DOCTYPE html>");
+        htmlContent.AppendLine("<html>");
+        htmlContent.AppendLine("<head>");
+        htmlContent.AppendLine("  <meta charset=\"utf-8\">");
+        htmlContent.AppendLine("  <script src=\"https://www.unpkg.com/mutation-testing-elements\"></script>");
+        htmlContent.AppendLine("</head>");
+        htmlContent.AppendLine("<body>");
+        htmlContent.AppendLine("  <mutation-test-report-app></mutation-test-report-app>");
+        htmlContent.AppendLine("  <script>");
+        htmlContent.AppendLine("    const app = document.querySelector('mutation-test-report-app');");
+        htmlContent.AppendLine($"    app.report = {finalJson};");
+        htmlContent.AppendLine("  </script>");
+        htmlContent.AppendLine("</body>");
+        htmlContent.AppendLine("</html>");
 
-        File.WriteAllText(Path.Combine(outputDir, reportName), htmlTemplate, Encoding.UTF8);
+        File.WriteAllText(Path.Combine(outputDir, reportName), htmlContent.ToString(), Encoding.UTF8);
     }
 }
