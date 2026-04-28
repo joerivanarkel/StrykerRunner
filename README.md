@@ -1,5 +1,5 @@
 # StrykerRunner
-
+ 
 A .NET global tool to run Stryker mutation testing across multiple projects and generate unified reports.
 
 ## What it does
