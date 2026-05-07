@@ -14,12 +14,12 @@ class Program
     {
         var testProjectOption = new Option<FileInfo?>(
             name: "--test-project",
-            description: "Path to the test project .csproj file. If not provided, searches for a .csproj in the current directory.",
+            description: "Path to the test project .csproj file. If not provided, auto-detects.",
             getDefaultValue: () => null);
 
         var solutionOption = new Option<FileInfo?>(
             name: "--solution",
-            description: "Path to a .sln or .slnx solution file. If not provided, auto-detects a solution in the current directory.",
+            description: "Path to a .sln or .slnx solution file. If not provided, auto-detects.",
             getDefaultValue: () => null);
 
         var outputDirOption = new Option<DirectoryInfo?>(
@@ -64,69 +64,90 @@ class Program
 
         var allFiles = new Dictionary<string, JsonElement>();
 
-        // Resolve solution: explicit flag → auto-detect .sln → auto-detect .slnx
-        if (solution == null && testProject == null)
+        // Auto-detect available files
+        var currentDir = Directory.GetCurrentDirectory();
+        var hasLocalSln = solution?.Exists ?? Directory.GetFiles(currentDir, "*.sln").Length > 0;
+        var hasLocalSlnx = solution?.Exists ?? Directory.GetFiles(currentDir, "*.slnx").Length > 0;
+        var hasLocalCsproj = testProject?.Exists ?? Directory.GetFiles(currentDir, "*.csproj").Length > 0;
+
+        // Resolve solution file if not provided
+        if (solution == null && (hasLocalSln || hasLocalSlnx))
         {
-            var currentDir = Directory.GetCurrentDirectory();
             var slnFiles = Directory.GetFiles(currentDir, "*.sln");
             var slnxFiles = Directory.GetFiles(currentDir, "*.slnx");
-
             if (slnFiles.Length > 0)
                 solution = new FileInfo(slnFiles[0]);
             else if (slnxFiles.Length > 0)
                 solution = new FileInfo(slnxFiles[0]);
         }
 
-        if (solution != null)
+        // Solution mode: if solution exists, use it
+        if (solution != null && solution.Exists)
         {
-            // Solution flow
-            if (!solution.Exists)
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[SOLUTION MODE] Detected solution: {solution.FullName}");
+            Console.ResetColor();
+
+            var allProjects = DiscoverAllProjectsFromSolution(solution);
+            var testProjects = allProjects.Where(p => Regex.IsMatch(Path.GetFileNameWithoutExtension(p.FullName), @"\.Tests?$", RegexOptions.IgnoreCase)).ToList();
+            var sourceProjects = allProjects.Where(p => !Regex.IsMatch(Path.GetFileNameWithoutExtension(p.FullName), @"\.Tests?$", RegexOptions.IgnoreCase)).ToList();
+
+            // Filter source projects by exclude patterns
+            sourceProjects = sourceProjects
+                .Where(p => !excludePatterns.Any(pattern => Regex.IsMatch(p.Name, pattern, RegexOptions.IgnoreCase)))
+                .ToList();
+
+            if (sourceProjects.Count == 0)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Error: Solution file not found: {solution.FullName}");
+                Console.WriteLine("Error: No source projects found to mutate in solution.");
                 Console.ResetColor();
                 return;
             }
 
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"[SOLUTION] Using solution: {solution.FullName}");
-            Console.ResetColor();
-
-            var testProjects = DiscoverTestProjectsFromSolution(solution);
-
             if (testProjects.Count == 0)
             {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine("Error: No test projects found in the solution. Test projects must match the pattern '*.Tests' or '*.Test'.");
+                Console.ForegroundColor = ConsoleColor.Yellow;
+                Console.WriteLine($"[WARNING] No test projects found in solution. Found {sourceProjects.Count} source project(s).");
                 Console.ResetColor();
                 return;
             }
 
             Console.ForegroundColor = ConsoleColor.Green;
-            Console.WriteLine($"[FOUND] Found {testProjects.Count} test project(s) in solution:");
+            Console.WriteLine($"[FOUND] {testProjects.Count} test project(s), {sourceProjects.Count} source project(s)");
             Console.ResetColor();
-            foreach (var tp in testProjects)
-            {
-                Console.ForegroundColor = ConsoleColor.Gray;
-                Console.WriteLine($"   - {tp.Name}");
-                Console.ResetColor();
-            }
 
+            // Run mutation testing: each test project tests its referenced source projects
             foreach (var tp in testProjects)
             {
-                await RunStrykerForTestProjectAsync(tp, runOutputDir, excludePatterns, allFiles);
+                var relevantSources = sourceProjects
+                    .Where(sp => ProjectReferenceExists(tp, sp))
+                    .ToList();
+
+                if (relevantSources.Count == 0)
+                {
+                    Console.ForegroundColor = ConsoleColor.Yellow;
+                    Console.WriteLine($"[SKIP] Test project {tp.Name} has no source project references.");
+                    Console.ResetColor();
+                    continue;
+                }
+
+                foreach (var sp in relevantSources)
+                {
+                    await RunStrykerForProjectAsync(sp, tp, Path.Combine(runOutputDir, sp.Name), allFiles);
+                }
             }
         }
         else
         {
-            // Single test-project flow
+            // Test-project mode: discover via test project
             if (testProject == null)
             {
-                var csprojFiles = Directory.GetFiles(Directory.GetCurrentDirectory(), "*.csproj");
+                var csprojFiles = Directory.GetFiles(currentDir, "*.csproj");
                 if (csprojFiles.Length == 0)
                 {
                     Console.ForegroundColor = ConsoleColor.Red;
-                    Console.WriteLine("Error: No .csproj found in the current directory. Please specify a test project with --test-project, a solution with --solution, or run from a project/solution directory.");
+                    Console.WriteLine("Error: No .csproj or .sln/.slnx found. Please run from a project or solution directory.");
                     Console.ResetColor();
                     return;
                 }
@@ -136,12 +157,16 @@ class Program
             if (!testProject.Exists)
             {
                 Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"Error: Test project file not found: {testProject.FullName}");
+                Console.WriteLine($"Error: Test project not found: {testProject.FullName}");
                 Console.ResetColor();
                 return;
             }
 
-            await RunStrykerForTestProjectAsync(testProject, runOutputDir, excludePatterns, allFiles);
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine($"[PROJECT MODE] Detected project: {testProject.Name}");
+            Console.ResetColor();
+
+            await RunStrykerViaTestProjectAsync(testProject, runOutputDir, excludePatterns, allFiles);
         }
 
         // Generate unified report
@@ -155,10 +180,70 @@ class Program
         Console.ResetColor();
     }
 
-    static async Task RunStrykerForTestProjectAsync(FileInfo testProject, string runOutputDir, string[] excludePatterns, Dictionary<string, JsonElement> allFiles)
+    static string ExtractProjectName(FileInfo projectFile)
+    {
+        return Path.GetFileNameWithoutExtension(projectFile.FullName);
+    }
+
+    static async Task RunStrykerForProjectAsync(FileInfo sourceProject, FileInfo testProject, string outputDir, Dictionary<string, JsonElement> allFiles)
+    {
+        Console.ForegroundColor = ConsoleColor.Cyan;
+        Console.WriteLine($"[MUTATING] {sourceProject.Name}");
+        Console.ResetColor();
+
+        var startInfo = new ProcessStartInfo
+        {
+            FileName = "dotnet",
+            Arguments = $"stryker --project \"{sourceProject.FullName}\" --test-project \"{testProject.FullName}\" --reporter json --output \"{outputDir}\"",
+            RedirectStandardOutput = true,
+            RedirectStandardError = true,
+            UseShellExecute = false,
+            CreateNoWindow = true
+        };
+
+        using var process = Process.Start(startInfo);
+        if (process == null)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine("Error: Failed to start Stryker process.");
+            Console.ResetColor();
+            return;
+        }
+
+        var output = await process.StandardOutput.ReadToEndAsync();
+        var error = await process.StandardError.ReadToEndAsync();
+        await process.WaitForExitAsync();
+
+        if (!string.IsNullOrWhiteSpace(output))
+            Console.WriteLine(output);
+
+        if (!string.IsNullOrWhiteSpace(error))
+        {
+            Console.ForegroundColor = ConsoleColor.Yellow;
+            Console.WriteLine(error);
+            Console.ResetColor();
+        }
+
+        // Collect JSON report
+        var jsonReport = FindJsonReport(outputDir);
+        if (jsonReport != null)
+        {
+            var reportData = await File.ReadAllTextAsync(jsonReport);
+            using var doc = JsonDocument.Parse(reportData);
+            if (doc.RootElement.TryGetProperty("files", out var files))
+            {
+                foreach (var file in files.EnumerateObject())
+                {
+                    allFiles[file.Name] = file.Value.Clone();
+                }
+            }
+        }
+    }
+
+    static async Task RunStrykerViaTestProjectAsync(FileInfo testProject, string runOutputDir, string[] excludePatterns, Dictionary<string, JsonElement> allFiles)
     {
         Console.ForegroundColor = ConsoleColor.Yellow;
-        Console.WriteLine($"[DISCOVER] Discovering project references from test project: {testProject.Name}");
+        Console.WriteLine($"[DISCOVER] Discovering project references from: {testProject.Name}");
         Console.ResetColor();
 
         var targetProjects = DiscoverTargetProjects(testProject, excludePatterns);
@@ -166,27 +251,17 @@ class Program
         if (targetProjects.Count == 0)
         {
             Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine($"Warning: No project references found to mutate for {testProject.Name}. Skipping...");
+            Console.WriteLine($"Warning: No project references found in {testProject.Name}.");
             Console.ResetColor();
             return;
         }
 
         Console.ForegroundColor = ConsoleColor.Green;
-        Console.WriteLine($"[FOUND] Found {targetProjects.Count} project(s) to mutate:");
+        Console.WriteLine($"[FOUND] Found {targetProjects.Count} project(s) to mutate");
         Console.ResetColor();
-        foreach (var proj in targetProjects)
-        {
-            Console.ForegroundColor = ConsoleColor.Gray;
-            Console.WriteLine($"   - {proj.Name}");
-            Console.ResetColor();
-        }
 
         foreach (var targetProj in targetProjects)
         {
-            Console.ForegroundColor = ConsoleColor.Cyan;
-            Console.WriteLine($"[TARGET] Targeting: {targetProj.Name}");
-            Console.ResetColor();
-
             var sourceProj = FindProjectFile(targetProj.ReferencePath, testProject.Directory!);
 
             if (sourceProj == null)
@@ -198,23 +273,75 @@ class Program
             }
 
             var projectOutputDir = Path.Combine(runOutputDir, targetProj.Name);
+            await RunStrykerForProjectAsync(sourceProj, testProject, projectOutputDir, allFiles);
+        }
+    }
 
-            await RunStrykerForProjectAsync(sourceProj, testProject, projectOutputDir);
+    static List<FileInfo> DiscoverAllProjectsFromSolution(FileInfo solution)
+    {
+        var projects = new List<FileInfo>();
+        var solutionDir = solution.DirectoryName ?? Directory.GetCurrentDirectory();
 
-            var jsonReport = FindJsonReport(projectOutputDir);
-            if (jsonReport != null)
+        try
+        {
+            if (solution.Extension.Equals(".slnx", StringComparison.OrdinalIgnoreCase))
             {
-                var reportData = await File.ReadAllTextAsync(jsonReport);
-                using var doc = JsonDocument.Parse(reportData);
-                if (doc.RootElement.TryGetProperty("files", out var files))
+                var doc = XDocument.Load(solution.FullName);
+                var paths = doc.Descendants("Project")
+                    .Select(e => e.Attribute("Path")?.Value)
+                    .Where(p => p != null && p.EndsWith(".csproj", StringComparison.OrdinalIgnoreCase))
+                    .Select(p => p!);
+
+                foreach (var relativePath in paths)
                 {
-                    foreach (var file in files.EnumerateObject())
-                    {
-                        allFiles[file.Name] = file.Value.Clone();
-                    }
+                    var fullPath = Path.GetFullPath(Path.Combine(solutionDir, relativePath.Replace('\\', Path.DirectorySeparatorChar)));
+                    projects.Add(new FileInfo(fullPath));
+                }
+            }
+            else
+            {
+                var slnText = File.ReadAllText(solution.FullName);
+                var projectLineRegex = new Regex(
+                    @"Project\(""\{[^}]+\}""\)\s*=\s*""(?<name>[^""]+)""\s*,\s*""(?<path>[^""]+\.csproj)""\s*,",
+                    RegexOptions.IgnoreCase);
+
+                foreach (Match match in projectLineRegex.Matches(slnText))
+                {
+                    var relativePath = match.Groups["path"].Value;
+                    var fullPath = Path.GetFullPath(Path.Combine(solutionDir, relativePath.Replace('\\', Path.DirectorySeparatorChar)));
+                    projects.Add(new FileInfo(fullPath));
                 }
             }
         }
+        catch (Exception ex)
+        {
+            Console.ForegroundColor = ConsoleColor.Red;
+            Console.WriteLine($"Error parsing solution file: {ex.Message}");
+            Console.ResetColor();
+        }
+
+        return projects;
+    }
+
+    static bool ProjectReferenceExists(FileInfo testProject, FileInfo sourceProject)
+    {
+        try
+        {
+            var doc = XDocument.Load(testProject.FullName);
+            var sourceProjectName = Path.GetFileNameWithoutExtension(sourceProject.FullName);
+            var projectReferences = doc.Descendants("ProjectReference")
+                .Where(pr => pr.Attribute("Include") != null)
+                .Select(pr => pr.Attribute("Include")!.Value);
+
+            foreach (var refPath in projectReferences)
+            {
+                var refProjectName = Path.GetFileNameWithoutExtension(refPath);
+                if (refProjectName.Equals(sourceProjectName, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+        }
+        catch { }
+        return false;
     }
 
     static List<FileInfo> DiscoverTestProjectsFromSolution(FileInfo solution)
@@ -356,44 +483,6 @@ class Program
         }
 
         return null;
-    }
-
-    static async Task RunStrykerForProjectAsync(FileInfo sourceProject, FileInfo testProject, string outputDir)
-    {
-        var startInfo = new ProcessStartInfo
-        {
-            FileName = "dotnet",
-            Arguments = $"stryker --project \"{sourceProject.FullName}\" --test-project \"{testProject.FullName}\" --reporter json --output \"{outputDir}\"",
-            RedirectStandardOutput = true,
-            RedirectStandardError = true,
-            UseShellExecute = false,
-            CreateNoWindow = true
-        };
-
-        using var process = Process.Start(startInfo);
-        if (process == null)
-        {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("Error: Failed to start Stryker process.");
-            Console.ResetColor();
-            return;
-        }
-
-        var output = await process.StandardOutput.ReadToEndAsync();
-        var error = await process.StandardError.ReadToEndAsync();
-        await process.WaitForExitAsync();
-
-        if (!string.IsNullOrWhiteSpace(output))
-        {
-            Console.WriteLine(output);
-        }
-
-        if (!string.IsNullOrWhiteSpace(error))
-        {
-            Console.ForegroundColor = ConsoleColor.Yellow;
-            Console.WriteLine(error);
-            Console.ResetColor();
-        }
     }
 
     static string? FindJsonReport(string outputDir)
